@@ -5,11 +5,13 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const EnvMap = std.process.EnvMap;
 const posix = std.posix;
+const build_config = @import("../build_config.zig");
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
 const terminalpkg = @import("../terminal/main.zig");
@@ -70,6 +72,16 @@ last_cursor_reset: ?std.time.Instant = null,
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
+
+/// Raw output logging state for the active session.
+session_output_log: ?SessionOutputLog = null,
+
+const SessionOutputLog = struct {
+    file: std.fs.File,
+    path: []const u8,
+    dir: []const u8,
+    uses_default_dir: bool,
+};
 
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
@@ -167,6 +179,8 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
+    session_output_log: bool,
+    session_output_log_dir: ?[]const u8,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -203,6 +217,13 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
+            .session_output_log = config.@"session-output-log",
+            .session_output_log_dir = if (config.@"session-output-log-dir") |v|
+                switch (v) {
+                    .optional, .required => |path| try alloc.dupe(u8, path),
+                }
+            else
+                null,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -308,10 +329,17 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .mailbox = opts.mailbox,
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
+        .session_output_log = null,
     };
+
+    self.updateSessionOutputLog(
+        opts.config.session_output_log,
+        opts.config.session_output_log_dir,
+    );
 }
 
 pub fn deinit(self: *Termio) void {
+    self.deinitSessionOutputLog();
     self.backend.deinit();
     self.terminal.deinit(self.alloc);
     self.config.deinit();
@@ -435,6 +463,10 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // from another thread.
     self.terminal_stream.handler.changeConfig(&self.config);
     td.backend.changeConfig(&self.config);
+    self.updateSessionOutputLog(
+        config.session_output_log,
+        config.session_output_log_dir,
+    );
 
     // Update the configuration that we know about.
     //
@@ -650,6 +682,8 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    self.writeSessionOutputLog(buf);
+
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
 
@@ -698,6 +732,105 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+}
+
+fn writeSessionOutputLog(self: *Termio, buf: []const u8) void {
+    const log_state = if (self.session_output_log) |*v| v else return;
+    log_state.file.writeAll(buf) catch |err| {
+        log.warn(
+            "session output log write failed path={s} err={}, disabling",
+            .{ log_state.path, err },
+        );
+        self.deinitSessionOutputLog();
+    };
+}
+
+fn updateSessionOutputLog(
+    self: *Termio,
+    enabled: bool,
+    configured_dir: ?[]const u8,
+) void {
+    if (enabled) {
+        if (self.session_output_log) |*log_state| {
+            const same_dir = if (configured_dir) |v|
+                !log_state.uses_default_dir and std.mem.eql(u8, log_state.dir, v)
+            else
+                log_state.uses_default_dir;
+
+            if (same_dir) return;
+        }
+
+        self.deinitSessionOutputLog();
+        self.session_output_log = self.initSessionOutputLog(configured_dir) catch |err| blk: {
+            log.warn("failed to initialize session output log err={}", .{err});
+            break :blk null;
+        };
+        return;
+    }
+
+    self.deinitSessionOutputLog();
+}
+
+fn deinitSessionOutputLog(self: *Termio) void {
+    const log_state = self.session_output_log orelse return;
+    log_state.file.close();
+    self.alloc.free(log_state.path);
+    self.alloc.free(log_state.dir);
+    self.session_output_log = null;
+}
+
+fn initSessionOutputLog(
+    self: *Termio,
+    configured_dir: ?[]const u8,
+) !SessionOutputLog {
+    const alloc = self.alloc;
+
+    const dir_path, const uses_default_dir = if (configured_dir) |v|
+        .{ try alloc.dupe(u8, v), false }
+    else default_dir: {
+        const base_dir = switch (builtin.os.tag) {
+            .macos => internal_os.macos.appSupportDir(alloc, "sessions") catch try internal_os.xdg.state(
+                alloc,
+                .{ .subdir = build_config.bundle_id },
+            ),
+            else => try internal_os.xdg.state(
+                alloc,
+                .{ .subdir = "ghostty" },
+            ),
+        };
+        defer alloc.free(base_dir);
+
+        break :default_dir .{
+            try std.fs.path.join(alloc, &.{ base_dir, "output-log" }),
+            true,
+        };
+    };
+    errdefer alloc.free(dir_path);
+
+    try std.fs.cwd().makePath(dir_path);
+
+    const file_name = try std.fmt.allocPrint(
+        alloc,
+        "session-{d}.raw",
+        .{std.time.nanoTimestamp()},
+    );
+    defer alloc.free(file_name);
+
+    const file_path = try std.fs.path.join(alloc, &.{ dir_path, file_name });
+    errdefer alloc.free(file_path);
+
+    const file = try std.fs.createFileAbsolute(file_path, .{
+        .truncate = true,
+        .exclusive = true,
+        .mode = 0o600,
+    });
+
+    return .{
+        .file = file,
+        .path = file_path,
+        .dir = dir_path,
+        .uses_default_dir = uses_default_dir,
+    };
 }
 
 /// Sends a DSR response for the current color scheme to the pty.

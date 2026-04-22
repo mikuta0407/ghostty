@@ -1348,6 +1348,29 @@ env: RepeatableStringMap = .{},
 /// Available since: 1.2.0
 input: RepeatableReadableIO = .{},
 
+/// If true, Ghostty writes raw PTY output bytes to a per-session log file.
+///
+/// This behaves similarly to `script`, but is implemented directly in
+/// Ghostty and does not require any external command.
+///
+/// A new file is created for each terminal session under the Ghostty state
+/// directory. The written bytes are raw terminal output (including escape
+/// sequences), without any post-processing.
+///
+/// Changing this configuration at runtime only affects new output.
+@"session-output-log": bool = false,
+
+/// Directory to use for per-session raw output logs.
+///
+/// If this is not set, Ghostty uses the platform default state location
+/// and writes logs under an `output-log` subdirectory.
+///
+/// If this is set, Ghostty writes session log files directly into the
+/// specified directory.
+///
+/// This only applies when `session-output-log` is true.
+@"session-output-log-dir": ?Path = null,
+
 /// If true, keep the terminal open after the command exits. Normally, the
 /// terminal window closes when the running command (such as a shell) exits.
 /// With this true, the terminal window will stay open until any keypress is
