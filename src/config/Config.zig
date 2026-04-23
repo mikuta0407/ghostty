@@ -345,6 +345,21 @@ language: ?[:0]const u8 = null,
 /// This is currently only supported on macOS.
 @"font-thicken-strength": u8 = 255,
 
+/// If true, force font thickening when rendering on non-Retina displays.
+///
+/// A display is considered non-Retina when the content scale is 1x.
+///
+/// This is currently only supported on macOS.
+@"font-thicken-non-retina": bool = false,
+
+/// Thickening strength used when `font-thicken-non-retina` is enabled
+/// and Ghostty is rendering on a non-Retina display.
+///
+/// Valid values are integers between `0` and `255`.
+///
+/// This is currently only supported on macOS.
+@"font-thicken-non-retina-strength": u8 = 1,
+
 /// Locations to break font shaping into multiple runs.
 ///
 /// A "run" is a contiguous segment of text that is shaped together. "Shaping"

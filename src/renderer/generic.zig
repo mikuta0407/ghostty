@@ -106,6 +106,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
 
+        /// The runtime surface, used for querying current content scale.
+        rt_surface: *apprt.Surface,
+
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
 
@@ -538,6 +541,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             font_thicken: bool,
             font_thicken_strength: u8,
+            font_thicken_non_retina: bool,
+            font_thicken_non_retina_strength: u8,
             font_features: std.ArrayListUnmanaged([:0]const u8),
             font_styles: font.CodepointResolver.StyleStatus,
             font_shaping_break: configpkg.FontShapingBreak,
@@ -609,6 +614,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
                     .font_thicken_strength = config.@"font-thicken-strength",
+                    .font_thicken_non_retina = config.@"font-thicken-non-retina",
+                    .font_thicken_non_retina_strength = config.@"font-thicken-non-retina-strength",
                     .font_features = font_features.list,
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
@@ -702,6 +709,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .alloc = alloc,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
+                .rt_surface = options.rt_surface,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
@@ -3172,6 +3180,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) !void {
             const cell = cell_raws[x];
             const cp = cell.codepoint();
+            const thicken = self.effectiveFontThicken();
 
             // Render
             const render = try self.font_grid.renderGlyph(
@@ -3180,8 +3189,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 shaper_cell.glyph_index,
                 .{
                     .grid_metrics = self.grid_metrics,
-                    .thicken = self.config.font_thicken,
-                    .thicken_strength = self.config.font_thicken_strength,
+                    .thicken = thicken.enabled,
+                    .thicken_strength = thicken.strength,
                     .cell_width = cell.gridWidth(),
                     // If there's no Nerd Font constraint for this codepoint
                     // then, if it's a symbol, we constrain it to fit inside
@@ -3219,6 +3228,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_y + shaper_cell.y_offset),
                 },
             });
+        }
+
+        fn effectiveFontThicken(self: *const Self) struct {
+            enabled: bool,
+            strength: u8,
+        } {
+            var enabled = self.config.font_thicken;
+            var strength = self.config.font_thicken_strength;
+
+            if (self.config.font_thicken_non_retina and
+                self.rt_surface.content_scale.x <= 1.0 and
+                self.rt_surface.content_scale.y <= 1.0)
+            {
+                enabled = true;
+                strength = self.config.font_thicken_non_retina_strength;
+            }
+
+            return .{ .enabled = enabled, .strength = strength };
         }
 
         fn addCursor(
